@@ -36,7 +36,7 @@ def delete_user(username):
         print(f"✅ IAM user '{username}' has been deleted successfully.")
 
         # Delete associated .txt file if it exists
-        file_path = f"{username}.txt"
+        file_path = f"./Credential-Folder/{username}.txt"
         if os.path.exists(file_path):
             os.remove(file_path)
             print(f"🗑️ Deleted file: {file_path}")
@@ -49,7 +49,7 @@ def delete_user(username):
         print(f"❌ Error: {error.response['Error']['Message']}")
 
 def main():
-    email = input("Enter the email (IAM username) of the user to delete: ").strip()
+    email = input(">> Enter the email (IAM username) of the user to delete: ").strip()
     delete_user(email)
 
 if __name__ == "__main__":

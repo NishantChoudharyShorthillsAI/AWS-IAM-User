@@ -1,114 +1,235 @@
 import boto3
+import botocore
 import json
-import os
+import random
+import string
+import sys
 
-def get_policy_arn(service, access_level):
-    policy_map = {
-        "ec2": {
-            "read": "arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess",
-            "full": "arn:aws:iam::aws:policy/AmazonEC2FullAccess"
-        },
-        "s3": {
-            "read": "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess",
-            "full": "arn:aws:iam::aws:policy/AmazonS3FullAccess"
-        }
-    }
-    return policy_map[service].get(access_level, None)
+iam = boto3.client('iam')
 
-def create_write_only_policy(service, region):
-    if service == "ec2":
-        return {
-            "Version": "2012-10-17",
-            "Statement": [{
-                "Effect": "Allow",
-                "Action": [
-                    "ec2:StartInstances",
-                    "ec2:StopInstances",
-                    "ec2:RebootInstances",
-                    "ec2:TerminateInstances",
-                    "ec2:CreateTags",
-                    "ec2:ModifyInstanceAttribute",
-                    "ec2:RunInstances"
-                ],
+aws_services = {
+    "EC2": "AmazonEC2",
+    "S3 bucket": "AmazonS3",
+    "RDS": "AmazonRDS",
+    "LAMBDA": "AWSLambda",
+    "ECR": "AmazonEC2ContainerRegistry",
+    "Cloud Watch": "CloudWatch",
+    "Cloud Front": "CloudFront",
+    "AWS amplify": "AWSAmplify",
+    "AWS bedrocks": "Bedrock"
+}
+
+access_levels = {
+    "Read": "ReadOnlyAccess",
+    "Full": "FullAccess"
+}
+
+def generate_random_password(length=12):
+    characters = string.ascii_letters + string.digits + string.punctuation
+    return ''.join(random.choice(characters) for _ in range(length))
+
+def user_exists(username):
+    try:
+        iam.get_user(UserName=username)
+        return True
+    except botocore.exceptions.ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchEntity':
+            return False
+        raise e
+
+def list_user_policies(username):
+    print(f"\n✅ IAM User '{username}' already exists.\n\n📌 Attached Managed Policies:")
+    managed = iam.list_attached_user_policies(UserName=username)['AttachedPolicies']
+    if managed:
+        for policy in managed:
+            print(f"- {policy['PolicyName']} ({policy['PolicyArn']})")
+    else:
+        print("- None")
+
+    print("\n📌 Inline Policies:")
+    inline = iam.list_user_policies(UserName=username)['PolicyNames']
+    if inline:
+        for policy in inline:
+            print(f"- {policy}")
+    else:
+        print("- None")
+
+def create_user(username):
+    iam.create_user(UserName=username)
+
+def delete_user(username):
+    try:
+        policies = iam.list_attached_user_policies(UserName=username)['AttachedPolicies']
+        for policy in policies:
+            iam.detach_user_policy(UserName=username, PolicyArn=policy['PolicyArn'])
+
+        inline_policies = iam.list_user_policies(UserName=username)['PolicyNames']
+        for name in inline_policies:
+            iam.delete_user_policy(UserName=username, PolicyName=name)
+
+        keys = iam.list_access_keys(UserName=username)['AccessKeyMetadata']
+        for key in keys:
+            iam.delete_access_key(UserName=username, AccessKeyId=key['AccessKeyId'])
+
+        try:
+            iam.delete_login_profile(UserName=username)
+        except botocore.exceptions.ClientError as e:
+            if e.response['Error']['Code'] != 'NoSuchEntity':
+                raise e
+
+        iam.delete_user(UserName=username)
+        print(f"🧹 Rolled back and deleted user '{username}' due to error.")
+    except Exception as e:
+        print(f"⚠️ Error cleaning up user '{username}': {e}")
+
+def create_access_key(username):
+    keys = iam.create_access_key(UserName=username)['AccessKey']
+    return keys['AccessKeyId'], keys['SecretAccessKey']
+
+def create_login_profile(username):
+    password = generate_random_password()
+    iam.create_login_profile(UserName=username, Password=password, PasswordResetRequired=False)
+    return password
+
+def store_credentials(username, content):
+    with open(f"./Credential-Folder/{username}.txt", "w") as f:
+        f.write(content)
+
+def attach_policy(username, policy_arn):
+    iam.attach_user_policy(UserName=username, PolicyArn=policy_arn)
+
+def put_inline_region_restrict_policy(username, region):
+    policy_name = "RegionRestriction"
+    policy_document = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Deny",
+                "Action": "*",
                 "Resource": "*",
                 "Condition": {
-                    "StringEquals": {
+                    "StringNotEquals": {
                         "aws:RequestedRegion": region
                     }
                 }
-            }]
-        }
-    elif service == "s3":
-        return {
-            "Version": "2012-10-17",
-            "Statement": [{
-                "Effect": "Allow",
-                "Action": [
-                    "s3:PutObject",
-                    "s3:DeleteObject",
-                    "s3:PutObjectAcl",
-                    "s3:AbortMultipartUpload",
-                    "s3:CreateBucket"
-                ],
-                "Resource": ["arn:aws:s3:::*", "arn:aws:s3:::*/*"],
-                "Condition": {
-                    "StringEquals": {
-                        "s3:LocationConstraint": region
-                    }
-                }
-            }]
-        }
+            }
+        ]
+    }
+    iam.put_user_policy(
+        UserName=username,
+        PolicyName=policy_name,
+        PolicyDocument=json.dumps(policy_document)
+    )
 
-def save_credentials(email, access_key_id, secret_access_key):
-    filename = f"{email}.txt"
-    with open(filename, "w") as f:
-        f.write(f"Email: {email}\n")
-        f.write(f"Access Key ID: {access_key_id}\n")
-        f.write(f"Secret Access Key: {secret_access_key}\n")
-    print(f"\n🔐 Credentials saved to file: {filename}")
+def get_account_id():
+    sts = boto3.client('sts')
+    return sts.get_caller_identity()["Account"]
+
+def create_custom_write_policy(service_name):
+    policy_name = f"{service_name}WriteOnly"
+    account_id = get_account_id()
+    policy_arn = f"arn:aws:iam::{account_id}:policy/{policy_name}"
+
+    try:
+        existing = iam.get_policy(PolicyArn=policy_arn)
+        return existing['Policy']['Arn']
+    except botocore.exceptions.ClientError as e:
+        if e.response['Error']['Code'] != 'NoSuchEntity':
+            raise e
+
+    policy_document = {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": [
+                f"{service_name.lower()}:Put*",
+                f"{service_name.lower()}:Create*",
+                f"{service_name.lower()}:Upload*"
+            ],
+            "Resource": "*"
+        }]
+    }
+
+    response = iam.create_policy(
+        PolicyName=policy_name,
+        PolicyDocument=json.dumps(policy_document)
+    )
+    return response['Policy']['Arn']
 
 def main():
-    iam = boto3.client('iam')
+    username = input(">> Enter IAM username to create: ")
 
-    email = input("Enter user's email ID (used as IAM username): ").strip()
-    show_keys = input("Do you want to show Access Key and Secret Key? (yes/no): ").strip().lower()
-    region = input("Enter AWS region: ").strip()
-    resource_choice = input("Which resource to assign? (EC2/S3/Both): ").strip().lower()
+    if user_exists(username):
+        list_user_policies(username)
+        return
 
-    # Create IAM user
     try:
-        iam.create_user(UserName=email)
-        print(f"IAM user '{email}' created.")
-    except iam.exceptions.EntityAlreadyExistsException:
-        print(f"User '{email}' already exists.")
+        create_user(username)
+        print("✅ User created successfully.")
 
-    # Access key
-    keys = iam.create_access_key(UserName=email)['AccessKey']
-    if show_keys == "yes":
-        print(f"Access Key: {keys['AccessKeyId']}")
-        print(f"Secret Key: {keys['SecretAccessKey']}")
-    save_credentials(email, keys['AccessKeyId'], keys['SecretAccessKey'])
+        choice = input(">> Do you want \n1.Access Key and Secret Key \n2.Login password?\n>> Enter 1 or 2: ")
 
-    def handle_policy(service):
-        access = input(f"Select {service.upper()} access level (read/write/full): ").strip().lower()
-        if access == "write":
-            policy_doc = create_write_only_policy(service, region)
-            iam.put_user_policy(UserName=email, PolicyName=f"Custom{service.upper()}WriteOnly", PolicyDocument=json.dumps(policy_doc))
-            print(f"✅ Custom {service.upper()} write-only policy with region restriction attached.")
-        elif access in ["read", "full"]:
-            arn = get_policy_arn(service, access)
-            iam.attach_user_policy(UserName=email, PolicyArn=arn)
-            print(f"✅ AWS-managed {service.upper()} {access.upper()} policy attached.")
+        creds = f"Username: {username}\n"
+
+        if choice == "1":
+            access_key, secret_key = create_access_key(username)
+            creds += f"Access Key: {access_key}\nSecret Key: {secret_key}\n"
         else:
-            print(f"❌ Invalid access level for {service.upper()}.")
+            password = create_login_profile(username)
+            attach_policy(username, "arn:aws:iam::aws:policy/IAMUserChangePassword")
+            creds += f"Login password: {password} \nLogin link: https://{get_account_id()}.signin.aws.amazon.com/console\n"
 
-    if resource_choice in ["ec2", "both"]:
-        handle_policy("ec2")
+        region = input(">> Enter AWS region to allow user to operate in: ")
+        creds += f"Region: {region}\n"
+        put_inline_region_restrict_policy(username, region)
 
-    if resource_choice in ["s3", "both"]:
-        handle_policy("s3")
+        services_added = []
+        
+        for i, service in enumerate(aws_services.keys(), 1):
+            print(f"{i}. {service}")
 
-    print("\n🎉 IAM user setup complete.")
+        while True:
+            print("\nSelect AWS Service from this list:")
+            # for i, service in enumerate(aws_services.keys(), 1):
+            #     print(f"{i}. {service}")
+            choice = int(input(f">> Enter choice number between (1-{len(aws_services)}): "))
+            if choice < 1 or choice > len(aws_services):
+                print("Invalid choice. Please try again....")
+                continue
+            service_name = list(aws_services.keys())[choice - 1]
+            service_prefix = aws_services[service_name]
+
+            access = input(f">> Enter access level on {service_name} (Read / Write / Full): ").capitalize()
+
+            if access in access_levels:
+                policy_arn = f"arn:aws:iam::aws:policy/{service_prefix}{access_levels[access]}"
+            elif access == "Write":
+                try:
+                    policy_arn = create_custom_write_policy(service_prefix)
+                    print(f"✅ Custom WriteOnly policy assigned: {policy_arn}")
+                except Exception as e:
+                    print(f"❌ Failed to create or assign write-only policy: {e}")
+                    continue
+            else:
+                print("Invalid access type. Skipping...")
+                continue
+
+            attach_policy(username, policy_arn)
+            services_added.append(f"{service_name} ({access})")
+
+            more = input(">> Do you want to add another service? (yes/no): ").strip().lower()
+            if more != "yes":
+                break
+            
+
+        creds += "\nServices Granted:\n"
+        creds += "\n".join(services_added)
+        store_credentials(username, creds)
+        print(f"\n✅ Details stored in ./Credential-Folder/{username}.txt")
+
+    except Exception as e:
+        print(f"❌ Error occurred: {e}")
+        delete_user(username)
 
 if __name__ == "__main__":
     main()
